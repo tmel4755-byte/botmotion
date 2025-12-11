@@ -487,7 +487,11 @@ async def back_to_start_from_list(call: types.CallbackQuery, state: FSMContext):
     except TelegramBadRequest:
         await bot.send_message(call.message.chat.id, "🌍 <b>Добро пожаловать в бот-напоминалку!</b>", reply_markup=get_start_keyboard())
     await call.answer()
-    
+
+
+from keep_alive import keep_alive
+keep_alive()
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
@@ -498,3 +502,7 @@ if __name__ == "__main__":
     finally:
         if session:
             asyncio.run(session.close())
+
+
+
+
