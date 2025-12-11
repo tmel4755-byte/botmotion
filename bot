@@ -1,0 +1,500 @@
+import asyncio, logging, datetime, os, pytz, uuid, aiosqlite, aiohttp
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest
+from dateutil.relativedelta import relativedelta
+
+# ----------------- CONFIG -----------------
+BOT_TOKEN = "8324482444:AAHBFg0Iss4Kn5Yh4pAMfilkCp0yMqOr7iA"
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+dp  = Dispatcher(storage=MemoryStorage())
+session = None
+
+# ----------------- CONSTANTS -----------------
+CITY_TZ = {
+    "Москва":"Europe/Moscow","Санкт-Петербург":"Europe/Moscow","Краснодар":"Europe/Moscow",
+    "Екатеринбург":"Asia/Yekaterinburg","Новосибирsk":"Asia/Novosibirsk","Владивосток":"Asia/Vladivostok",
+    "Казань":"Europe/Moscow","Белгород":"Europe/Moscow","Лондон":"Europe/London","Париж":"Europe/Paris",
+    "Берлин":"Europe/Berlin","Рим":"Europe/Rome","Амстердам":"Europe/Amsterdam","Мадрид":"Europe/Madrid",
+    "Варшава":"Europe/Warsaw","Стокгольм":"Europe/Stockholm","Токио":"Asia/Tokyo","Сеул":"Asia/Seoul",
+    "Шанхай":"Asia/Shanghai","Сингапур":"Asia/Singapore","Дубай":"Asia/Dubai","Мумбаи":"Asia/Kolkata",
+    "Нью-Йорк":"America/New_York","Лос-Анджелес":"America/Los_Angeles","Торонто":"America/Toronto",
+    "Мехико":"America/Mexico_City","Сан-Паулу":"America/Sao_Paulo","Сидней":"Australia/Sydney","Окленд":"Pacific/Auckland",
+}
+
+# ----------------- GLOBALS -----------------
+active_reminders = {}   # reminder_id -> dict
+user_limits        = {}   # anti-spam
+
+# ----------------- FSM -----------------
+class RemindForm(StatesGroup):
+    city    = State()
+    dt      = State()
+    repeat  = State()
+    weekday = State()
+    text    = State()
+    confirm = State()
+
+# ----------------- DB -----------------
+async def init_db():
+    async with aiosqlite.connect("reminders.db") as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS reminders(
+                id TEXT PRIMARY KEY,
+                chat_id INTEGER,
+                user_id INTEGER,
+                city TEXT,
+                dt TEXT,
+                repeat TEXT,
+                text TEXT,
+                silent INTEGER
+            )
+        """)
+        await db.commit()
+
+async def save_reminder(rid, cid, uid, city, dt, repeat, text, silent):
+    dt_utc = dt.astimezone(pytz.utc)
+    async with aiosqlite.connect("reminders.db") as db:
+        await db.execute(
+            "INSERT INTO reminders VALUES (?,?,?,?,?,?,?,?)",
+            (rid, cid, uid, city, dt_utc.isoformat(), repeat, text, silent)
+        )
+        await db.commit()
+
+async def update_reminder_dt(rid, new_dt):
+    dt_utc = new_dt.astimezone(pytz.utc)
+    async with aiosqlite.connect("reminders.db") as db:
+        await db.execute("UPDATE reminders SET dt=? WHERE id=?", (dt_utc.isoformat(), rid))
+        await db.commit()
+
+async def delete_reminder(rid):
+    async with aiosqlite.connect("reminders.db") as db:
+        await db.execute("DELETE FROM reminders WHERE id=?", (rid,))
+        await db.commit()
+
+# ----------------- REMINDER ENGINE -----------------
+def get_next_dt(current_dt, repeat_type):
+    if repeat_type == "daily":   return current_dt + relativedelta(days=1)
+    if repeat_type == "weekly":  return current_dt + relativedelta(weeks=1)
+    if repeat_type == "interval_1min": return current_dt + relativedelta(minutes=1)
+    return None
+
+async def remind_loop(chat_id, text, initial_dt, rid, repeat_type, silent):
+    dt = initial_dt
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🛑 Стоп", callback_data=f"stop_{rid}")
+    markup = builder.as_markup()
+
+    while True:
+        now = datetime.datetime.now(pytz.utc)
+        dt_utc = dt.astimezone(pytz.utc)
+        delay = (dt_utc - now).total_seconds()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        # 1. Удаляем предыдущее сообщение (если есть)
+        last_id = active_reminders[rid].get("last_msg_id")
+        if last_id:
+            try:
+                await bot.delete_message(chat_id, last_id)
+            except Exception:
+                pass  # не страшно, если уже удалено/истекло
+
+        # 2. Отправляем новое
+        msg = await bot.send_message(
+            chat_id,
+            f"🔔 <b>Напоминание:</b> {text}",
+            disable_notification=silent,
+            reply_markup=markup
+        )
+        # 3. Запоминаем новый ID
+        active_reminders[rid]["last_msg_id"] = msg.message_id
+
+        # 4. Логика повторения
+        if repeat_type == "once":
+            await delete_reminder(rid)
+            active_reminders[rid]["task"].cancel()
+            del active_reminders[rid]
+            break
+        else:
+            dt = get_next_dt(dt, repeat_type)
+            await update_reminder_dt(rid, dt)
+            active_reminders[rid]["dt"] = dt
+            
+                    
+async def load_reminders():
+    if not os.path.exists("reminders.db"): return
+    async with aiosqlite.connect("reminders.db") as db:
+        async with db.execute("SELECT * FROM reminders") as cur:
+            async for row in cur:
+                rid, cid, uid, city, dt_str, repeat, text, silent = row
+                dt = datetime.datetime.fromisoformat(dt_str)
+                task = asyncio.create_task(remind_loop(cid, text, dt, rid, repeat, bool(silent)))
+                active_reminders[rid] = {
+    "task":task, "last_msg_id":None, "chat_id":cid,
+    "text":text, "repeat":repeat, "silent":bool(silent),
+    "user_id":uid, "dt":dt, "city":city
+}
+
+# ----------------- KEYBOARDS -----------------
+
+def get_start_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="➕ Создать напоминание", callback_data="create_remind")
+    b.button(text="📋 Активные напоминания", callback_data="list_active")
+    b.adjust(1)
+    return b.as_markup()
+
+def get_city_keyboard():
+    b = InlineKeyboardBuilder()
+    for c in list(CITY_TZ.keys())[:12]:
+        b.button(text=f"🏙️ {c}", callback_data=f"city_{c}")
+    b.adjust(2)
+    return b.as_markup()
+
+def get_dt_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Назад", callback_data="back_start")
+    return b.as_markup()
+
+def get_repeat_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Один раз", callback_data="repeat_once")
+    b.button(text="⏱️ Каждую 1 мин", callback_data="repeat_interval_1min")
+    b.button(text="📅 Ежедневно", callback_data="repeat_daily")
+    b.button(text="📆 Еженедельно", callback_data="repeat_weekly")
+    b.button(text="⬅️ Назад", callback_data="back_dt")
+    b.adjust(2)
+    return b.as_markup()
+
+def get_weekday_keyboard():
+    b = InlineKeyboardBuilder()
+    for i, day in enumerate(["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]):
+        b.button(text=day, callback_data=f"weekday_{i}")
+    b.button(text="⬅️ Назад", callback_data="back_repeat_choice")
+    b.adjust(2)
+    return b.as_markup()
+
+def get_text_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Назад", callback_data="back_repeat_choice")
+    return b.as_markup()
+
+def get_confirm_keyboard():
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Подтвердить", callback_data="confirm_yes")
+    b.button(text="❌ Отменить", callback_data="confirm_no")
+    b.button(text="⬅️ Назад", callback_data="back_confirm")
+    b.adjust(2)
+    return b.as_markup()
+
+# ----------------- HANDLERS -----------------
+@dp.message(CommandStart())
+async def start(msg: types.Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("🌍 <b>Добро пожаловать в бот-напоминалку!</b>", reply_markup=get_start_keyboard())
+
+@dp.callback_query(lambda c: c.data == "back_start")
+async def back_start(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(RemindForm.city)
+    try:
+        await call.message.edit_text("🌍 <b>Добро пожаловать!</b>\nВыберите город:", reply_markup=get_city_keyboard())
+    except TelegramBadRequest:
+        await bot.send_message(call.message.chat.id, "🌍 <b>Добро пожаловать!</b>\nВыберите город:", reply_markup=get_city_keyboard())
+    await call.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("city_"))
+async def got_city(call: types.CallbackQuery, state: FSMContext):
+    city = call.data.replace("city_", "")
+    await state.update_data(city=city)
+    await state.set_state(RemindForm.dt)
+    try:
+        await call.message.edit_text("📅 <b>Введите дату и время</b> (ДД.ММ.ГГГГ ЧЧ:ММ):", reply_markup=get_dt_keyboard())
+    except TelegramBadRequest:
+        await bot.send_message(call.message.chat.id, "📅 <b>Введите дату и время</b> (ДД.ММ.ГГГГ ЧЧ:ММ):", reply_markup=get_dt_keyboard())
+    await call.answer()
+
+@dp.message(RemindForm.city, F.text)
+async def handle_city_input(msg: types.Message, state: FSMContext):
+    query = msg.text.strip().lower()
+    for c in CITY_TZ:
+        if query == c.lower():
+            await state.update_data(city=c)
+            await bot.delete_message(msg.chat.id, msg.message_id)
+            await msg.answer("📅 <b>Введите дату и время</b> (ДД.ММ.ГГГГ ЧЧ:ММ):", reply_markup=get_dt_keyboard())
+            await state.set_state(RemindForm.dt)
+            return
+    matches = [c for c in CITY_TZ if query in c.lower()][:10]
+    if matches:
+        b = InlineKeyboardBuilder()
+        for c in matches: b.button(text=f"🏙️ {c}", callback_data=f"city_{c}")
+        b.button(text="⬅️ Назад", callback_data="back_start")
+        b.adjust(2)
+        await msg.answer("🔍 Найденные города:", reply_markup=b.as_markup())
+    else:
+        await msg.answer("❌ Город не найден. Попробуйте другой.")
+
+@dp.message(RemindForm.dt)
+async def get_dt(msg: types.Message, state: FSMContext):
+    data = await state.get_data()
+    city = data.get("city")
+    if not city:
+        await msg.answer("❌ Ошибка. Начните сначала.", reply_markup=get_city_keyboard())
+        await state.set_state(RemindForm.city)
+        return
+    tz = pytz.timezone(CITY_TZ[city])
+    try:
+        dt = tz.localize(datetime.datetime.strptime(msg.text.strip(), "%d.%m.%Y %H:%M"))
+    except ValueError:
+        await msg.answer("❌ Неверный формат. Попробуйте ещё раз:", reply_markup=get_dt_keyboard())
+        return
+    await state.update_data(dt=dt)
+    await bot.delete_message(msg.chat.id, msg.message_id)
+    if "bot_msg_id" in data:
+        try: await bot.delete_message(msg.chat.id, data["bot_msg_id"])
+        except: pass
+    m = await msg.answer("🔁 <b>Выберите тип повторения:</b>", reply_markup=get_repeat_keyboard())
+    await state.update_data(bot_msg_id=m.message_id)
+    await state.set_state(RemindForm.repeat)
+
+@dp.callback_query(lambda c: c.data == "back_dt")
+async def back_dt(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(RemindForm.dt)
+    try:
+        await call.message.edit_text("📅 <b>Введите дату и время</b> (ДД.ММ.ГГГГ ЧЧ:ММ):", reply_markup=get_dt_keyboard())
+    except TelegramBadRequest:
+        await bot.send_message(call.message.chat.id, "📅 <b>Введите дату и время</b> (ДД.ММ.ГГГГ ЧЧ:ММ):", reply_markup=get_dt_keyboard())
+    await call.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("repeat_"), RemindForm.repeat)
+async def get_repeat(call: types.CallbackQuery, state: FSMContext):
+    repeat = call.data.replace("repeat_", "")
+    await state.update_data(repeat=repeat)
+    if repeat == "weekly":
+        try:
+            await call.message.edit_text("📆 <b>Выберите день недели:</b>", reply_markup=get_weekday_keyboard())
+        except TelegramBadRequest:
+            await bot.send_message(call.message.chat.id, "📆 <b>Выберите день недели:</b>", reply_markup=get_weekday_keyboard())
+        await state.set_state(RemindForm.weekday)
+    else:
+        try:
+            await call.message.edit_text("📝 <b>Введите текст напоминания:</b>", reply_markup=get_text_keyboard())
+        except TelegramBadRequest:
+            await bot.send_message(call.message.chat.id, "📝 <b>Введите текст напоминания:</b>", reply_markup=get_text_keyboard())
+        await state.set_state(RemindForm.text)
+    await call.answer()
+
+# 1. Назад с экрана «Выберите день недели» → «Тип повторения»
+@dp.callback_query(lambda c: c.data == "back_repeat_choice", RemindForm.weekday)
+async def back_from_weekday(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(RemindForm.repeat)
+    try:
+        await call.message.edit_text("🔁 <b>Выберите тип повторения:</b>", reply_markup=get_repeat_keyboard())
+    except TelegramBadRequest:
+        await bot.send_message(call.message.chat.id, "🔁 <b>Выберите тип повторения:</b>", reply_markup=get_repeat_keyboard())
+    await call.answer()
+
+
+# 2. Назад с экрана «Введите текст напоминания» → туда, откуда пришли
+@dp.callback_query(lambda c: c.data == "back_repeat_choice", RemindForm.text)
+async def back_from_text(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    # если при создании выбирали «еженедельно» – возвращаем к выбору дня
+    if data.get("repeat") == "weekly":
+        await state.set_state(RemindForm.weekday)
+        await call.message.edit_text("📆 <b>Выберите день недели:</b>", reply_markup=get_weekday_keyboard())
+    else:
+        # иначе – к выбору типа повторения
+        await state.set_state(RemindForm.repeat)
+        await call.message.edit_text("🔁 <b>Выберите тип повторения:</b>", reply_markup=get_repeat_keyboard())
+    await call.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("weekday_"), RemindForm.weekday)
+async def get_weekday(call: types.CallbackQuery, state: FSMContext):
+    weekday_index = int(call.data.split("_")[1])
+    weekdays = ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"]
+    weekday_name = weekdays[weekday_index]
+    await state.update_data(weekday=weekday_index, weekday_name=weekday_name)
+
+    data = await state.get_data()
+    dt = data["dt"]
+    current_weekday = dt.weekday()
+    days_ahead = (weekday_index - current_weekday) % 7
+    if days_ahead != 0:
+        dt = dt + relativedelta(days=days_ahead)
+    await state.update_data(dt=dt)
+
+    try:
+        await call.message.edit_text("📝 <b>Введите текст напоминания:</b>", reply_markup=get_text_keyboard())
+    except TelegramBadRequest:
+        await bot.send_message(call.message.chat.id, "📝 <b>Введите текст напоминания:</b>", reply_markup=get_text_keyboard())
+    await state.set_state(RemindForm.text)
+    await call.answer()
+
+@dp.message(RemindForm.text, F.text)
+async def get_text(msg: types.Message, state: FSMContext):
+    text = msg.text.strip()
+    if not text:
+        await msg.answer("❌ Текст не может быть пустым.")
+        return
+    await state.update_data(text=text)
+    await bot.delete_message(msg.chat.id, msg.message_id)
+    await confirm_reminder(msg, state)
+
+async def confirm_reminder(msg: types.Message, state: FSMContext):
+    data = await state.get_data()
+    dt_local = data["dt"].astimezone(pytz.timezone(CITY_TZ[data["city"]]))
+    summary  = f"<b>Ваше напоминание:</b>\n\n"
+    summary += f"🌍 Город: <b>{data['city']}</b>\n"
+    summary += f"⏰ Время: <b>{dt_local.strftime('%d.%m.%Y %H:%M')}</b>\n"
+    repeat_map = {"once":"Один раз","interval_1min":"Каждую 1 минуту","daily":"Ежедневно","weekly":"Еженедельно"}
+    repeat_text = repeat_map.get(data['repeat'], "Неизвестно")
+    if data['repeat'] == 'weekly' and 'weekday_name' in data:
+        repeat_text += f" (<b>{data['weekday_name']}</b>)"
+    summary += f"🔁 Повтор: <b>{repeat_text}</b>\n"
+    summary += f"📝 Текст: <i>{data['text']}</i>\n"
+    m = await msg.answer(summary, reply_markup=get_confirm_keyboard())
+    await state.update_data(bot_msg_id=m.message_id)
+    await state.set_state(RemindForm.confirm)
+
+@dp.callback_query(lambda c: c.data == "confirm_yes", RemindForm.confirm)
+async def confirm_yes(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    rid = str(uuid.uuid4())
+    await save_reminder(rid, call.message.chat.id, call.from_user.id,
+                        data['city'], data['dt'], data['repeat'], data['text'], 0)
+    task = asyncio.create_task(remind_loop(call.message.chat.id, data['text'],
+                                           data['dt'], rid, data['repeat'], False))
+    active_reminders[rid] = {
+    "task":task, "last_msg_id":None, "chat_id":call.message.chat.id,
+    "text":data['text'], "repeat":data['repeat'], "silent":False,
+    "user_id":call.from_user.id, "dt":data['dt'], "city":data['city']
+}
+    try:
+        await call.message.edit_text(call.message.html_text + "\n\n<b>✅ Напоминание сохранено и запущено!</b>")
+    except TelegramBadRequest:
+        await bot.send_message(call.message.chat.id, "<b>✅ Напоминание сохранено и запущено!</b>")
+    await state.clear()
+    await call.answer("Напоминание сохранено!")
+
+@dp.callback_query(lambda c: c.data == "confirm_no", RemindForm.confirm)
+async def confirm_no(call: types.CallbackQuery, state: FSMContext):
+    try:
+        await call.message.edit_text(call.message.html_text + "\n\n<b>❌ Напоминание отменено.</b>")
+    except TelegramBadRequest:
+        await bot.send_message(call.message.chat.id, "<b>❌ Напоминание отменено.</b>")
+    await state.clear()
+    await call.answer("Напоминание отменено.")
+
+@dp.callback_query(lambda c: c.data == "back_confirm")
+async def back_confirm(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(RemindForm.text)
+    try:
+        await call.message.edit_text("📝 <b>Введите текст напоминания:</b>", reply_markup=get_text_keyboard())
+    except TelegramBadRequest:
+        await bot.send_message(call.message.chat.id, "📝 <b>Введите текст напоминания:</b>", reply_markup=get_text_keyboard())
+    await call.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("stop_"))
+async def stop_reminder(call: types.CallbackQuery):
+    rid = call.data.replace("stop_", "")
+    if rid not in active_reminders:
+        await call.answer("Уже остановлено")
+        return
+
+    # удаляем сообщение-напоминание, чтобы вообще не висело
+    last = active_reminders[rid].get("last_msg_id")
+    if last:
+        try:
+            await bot.delete_message(call.message.chat.id, last)
+        except Exception:
+            pass   # не критично
+
+    active_reminders[rid]["task"].cancel()
+    del active_reminders[rid]
+    await delete_reminder(rid)
+    await call.answer("Напоминание остановлено!")
+# ----------------- MAIN -----------------
+async def main():
+    global session
+    session = aiohttp.ClientSession()
+    await init_db()
+    await load_reminders()
+    await dp.start_polling(bot)
+
+
+
+
+# --- НОВЫЕ ОБРАБОТЧИКИ ---
+@dp.callback_query(lambda c: c.data == "create_remind")
+async def create_remind(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(RemindForm.city)
+    try:
+        await call.message.edit_text("🌍 Выберите город:", reply_markup=get_city_keyboard())
+    except TelegramBadRequest:
+        await bot.send_message(call.message.chat.id, "🌍 Выберите город:", reply_markup=get_city_keyboard())
+    await call.answer()
+
+@dp.callback_query(lambda c: c.data == "list_active")
+async def list_active(call: types.CallbackQuery):
+    if not active_reminders:
+        await call.answer("📭 Активных напоминаний нет", show_alert=True)
+        return
+    b = InlineKeyboardBuilder()
+    for rid, info in active_reminders.items():
+        dt_local = info["dt"].astimezone(pytz.timezone(CITY_TZ[info["city"]]))
+        b.button(text=f'{dt_local.strftime("%d.%m %H:%M")} – {info["text"][:25]}',
+                 callback_data=f'del_{rid}')
+    b.button(text="⬅️ Назад", callback_data="back_to_start")
+    b.adjust(1)
+    try:
+        await call.message.edit_text("📋 <b>Ваши активные напоминания:</b>", reply_markup=b.as_markup())
+    except TelegramBadRequest:
+        await bot.send_message(call.message.chat.id, "📋 <b>Ваши активные напоминания:</b>", reply_markup=b.as_markup())
+    await call.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("del_"))
+async def delete_active(call: types.CallbackQuery):
+    rid = call.data.replace("del_", "")
+    if rid not in active_reminders:
+        await call.answer("Уже удалено", show_alert=True)
+        return
+    last = active_reminders[rid].get("last_msg_id")
+    if last:
+        try:
+            await bot.delete_message(call.message.chat.id, last)
+        except Exception:
+            pass
+    active_reminders[rid]["task"].cancel()
+    del active_reminders[rid]
+    await delete_reminder(rid)
+    await call.answer("✅ Удалено")
+    await list_active(call)  # обновим список
+
+@dp.callback_query(lambda c: c.data == "back_to_start")
+async def back_to_start_from_list(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await call.message.edit_text("🌍 <b>Добро пожаловать в бот-напоминалку!</b>", reply_markup=get_start_keyboard())
+    except TelegramBadRequest:
+        await bot.send_message(call.message.chat.id, "🌍 <b>Добро пожаловать в бот-напоминалку!</b>", reply_markup=get_start_keyboard())
+    await call.answer()
+    
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Bot stopped by user")
+    except Exception as e:
+        logging.error(f"Unhandled error: {e}")
+    finally:
+        if session:
+            asyncio.run(session.close())
